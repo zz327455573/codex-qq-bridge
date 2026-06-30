@@ -141,6 +141,30 @@ def count_lines(path: Path) -> int:
         return 0
 
 
+def find_actions(data) -> list:
+    """深度递归搜索 JSON 结构中所有的 toolAction 或 toolSummary 字段"""
+    actions = []
+    if isinstance(data, dict):
+        ta = data.get("toolAction") or data.get("toolSummary")
+        if ta and isinstance(ta, str):
+            actions.append(ta)
+        arg_json = data.get("argumentsJson")
+        if arg_json and isinstance(arg_json, str):
+            try:
+                sub = json.loads(arg_json)
+                sub_ta = sub.get("toolAction") or sub.get("toolSummary")
+                if sub_ta and isinstance(sub_ta, str):
+                    actions.append(sub_ta)
+            except Exception:
+                pass
+        for v in data.values():
+            actions.extend(find_actions(v))
+    elif isinstance(data, list):
+        for item in data:
+            actions.extend(find_actions(item))
+    return actions
+
+
 def parse_codex_line(line: str) -> Optional[str]:
     """解析 Codex JSONL 的一行，提取 assistant 回复文本。
 
@@ -547,6 +571,21 @@ async def jsonl_poll():
                 lines = f.readlines()
 
             for line in lines[_jsonl_watermark:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    actions = find_actions(obj)
+                    for act in actions:
+                        act = act.strip()
+                        if act:
+                            logger.info(f"[Poll -> QQ Action] {act}")
+                            await send_message_rest(MASTER_OPENID, act)
+                            await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
                 text = parse_codex_line(line)
                 if text:
                     # 防历史刷屏：如果是旧行（已有 watermark），跳过
