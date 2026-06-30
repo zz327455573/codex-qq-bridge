@@ -82,6 +82,9 @@ _http_client = None
 _running = False
 _last_seq: Optional[int] = None
 _last_msg_id: Optional[str] = None
+_last_typing_sent_time = 0.0  # 记录上次发送“正在输入”通知的时间戳
+_is_generating = False  # 是否处于等待 AI 响应的生成状态
+_generating_since = 0.0  # 进入生成状态的时间，超时自动 reset
 _bot_openid: str = ""
 _poll_task: Optional[asyncio.Task] = None
 
@@ -141,72 +144,84 @@ def count_lines(path: Path) -> int:
         return 0
 
 
-def find_actions(data) -> list:
-    """深度递归搜索 JSON 结构中所有的 toolAction 或 toolSummary 字段"""
-    actions = []
-    if isinstance(data, dict):
-        ta = data.get("toolAction") or data.get("toolSummary")
-        if ta and isinstance(ta, str):
-            actions.append(ta)
-        arg_json = data.get("argumentsJson")
-        if arg_json and isinstance(arg_json, str):
-            try:
-                sub = json.loads(arg_json)
-                sub_ta = sub.get("toolAction") or sub.get("toolSummary")
-                if sub_ta and isinstance(sub_ta, str):
-                    actions.append(sub_ta)
-            except Exception:
-                pass
-        for v in data.values():
-            actions.extend(find_actions(v))
-    elif isinstance(data, list):
-        for item in data:
-            actions.extend(find_actions(item))
-    return actions
+def translate_structured_line(obj: dict) -> Optional[str]:
+    """Strictly translate known JSONL structured fields to QQ text.
+    
+    Only handles well-known Codex JSONL structure:
+      response_item / message (assistant)   -> final reply text
+      event_msg    / agent_message          -> legacy compat
 
+    Skips (intermediate, NOT pushed to QQ):
+      response_item / function_call        -> tool call (intermediate)
+      response_item / function_call_output -> tool result (intermediate)
+      response_item / reasoning             -> thinking (intermediate)
+      event_msg    / agent_message          -> legacy compat
 
-def parse_codex_line(line: str) -> Optional[str]:
-    """解析 Codex JSONL 的一行，提取 assistant 回复文本。
-
-    支持两种格式:
-      1. event_msg / agent_message → payload.message
-      2. response_item / role=assistant → payload.content[].text
+    No guessing. No regex. No heuristic parsing.
+    Unknown types -> returns None (silently skipped).
     """
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
+    if not isinstance(obj, dict):
         return None
 
-    t = obj.get("type")
+    msg_type = obj.get("type", "")
 
-    # 格式1: event_msg / agent_message
-    if t == "event_msg":
+    # --- response_item ---
+    if msg_type == "response_item":
         payload = obj.get("payload", {})
-        if payload.get("type") == "agent_message":
-            msg = payload.get("message", "")
-            if msg and not msg.startswith("{") and msg.strip():
-                return msg.strip()
-        return None
+        if not isinstance(payload, dict):
+            return None
+        ptype = payload.get("type", "")
 
-    # 格式2: response_item / assistant
-    if t == "response_item":
-        payload = obj.get("payload", {})
-        if payload.get("type") == "message" and payload.get("role") == "assistant":
+        if ptype == "function_call":
+            return None
+
+        # function_call_output
+        if ptype == "function_call_output":
+            return None
+
+        # reasoning → skip (intermediate)
+        if ptype == "reasoning":
+            return None
+
+        # message: only assistant role = final reply
+        if ptype == "message" and payload.get("role") == "assistant":
             content = payload.get("content", [])
             texts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    t = block.get("text", "").strip()
-                    if t:
-                        texts.append(t)
-            return "\n\n".join(texts) if texts else None
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "output_text":
+                        t = block.get("text", "").strip()
+                        if t:
+                            texts.append(t)
+            if texts:
+                final = "\n\n".join(texts)
+                if len(final) > 1500:
+                    final = final[:1500] + "\n...(truncated)"
+                return final
+            return None
 
+        # other response_item types -> skip
+        return None
+
+    # --- event_msg (backup path for agent_message) ---
+    if msg_type == "event_msg":
+        _payload = obj.get("payload")
+        if isinstance(_payload, dict) and _payload.get("type") == "agent_message":
+            msg = _payload.get("message", "")
+            if isinstance(msg, str) and msg.strip():
+                text = msg.strip()
+                if len(text) > 1500:
+                    text = text[:1500] + "\n...(truncated)"
+                return text
+        return None
+
+    # unknown type -> skip
     return None
 
 
 def refresh_session_jsonl() -> bool:
     """刷新当前追踪的 JSONL 文件。检测是否有新会话文件生成。"""
-    global _jsonl_path, _jsonl_watermark
+    global _jsonl_path, _jsonl_watermark, _last_sent_ts
 
     latest = find_latest_session_jsonl()
 
@@ -217,6 +232,7 @@ def refresh_session_jsonl() -> bool:
     if not _jsonl_path or latest != _jsonl_path:
         _jsonl_path = latest
         _jsonl_watermark = count_lines(latest)
+        _last_sent_ts = ""
         logger.info(f"[Session] Switched to: {latest.name} (watermark={_jsonl_watermark})")
         return True
 
@@ -229,21 +245,21 @@ async def send_to_codex(message: str):
     """通过 tmux send-keys 发送消息给 Codex。"""
     # Escape 退出现有 TUI 状态
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Escape", ""
     )
     await proc.communicate()
     await asyncio.sleep(0.3)
 
     # 发送消息
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, message, ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", message, ""
     )
     await proc.communicate()
     await asyncio.sleep(0.1)
 
     # 回车
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "Enter", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Enter", ""
     )
     await proc.communicate()
     logger.info(f"[Bridge -> Codex] {message[:100]}")
@@ -253,7 +269,7 @@ async def start_codex_in_tmux():
     """启动 Codex 交互模式到 tmux codex 会话。"""
     # 确保 tmux session 存在
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "has-session", "-t", TMUX_SESSION,
+        "tmux", "has-session", "-t", f"{TMUX_SESSION}:",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     await proc.communicate()
@@ -265,27 +281,28 @@ async def start_codex_in_tmux():
         await proc.communicate()
         await asyncio.sleep(1)
 
-    # 清空可能的残留输入
-    for key in ["C-c", "C-c"]:
+        # 清空可能的残留输入
+        for key in ["C-c", "C-c"]:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", key, ""
+            )
+            await proc.communicate()
+            await asyncio.sleep(0.2)
+
+        # 启动 Codex
+        # --no-alt-screen: TUI 输出不切屏，方便 send-keys 交互
+        # --sandbox danger-full-access: 全权限沙箱
+        # --ask-for-approval on-request: Codex 自己判断是否需要问用户
+        cmd = "cd /root && codex --no-alt-screen --sandbox danger-full-access --ask-for-approval on-request"
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, key, ""
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", cmd, "Enter"
         )
         await proc.communicate()
-        await asyncio.sleep(0.2)
+        logger.info(f"[Start] Codex launched in tmux session '{TMUX_SESSION}'")
+        # 等待 Codex 初始化
+        await asyncio.sleep(8)
 
-    # 启动 Codex
-    # --no-alt-screen: TUI 输出不切屏，方便 send-keys 交互
-    # --sandbox danger-full-access: 全权限沙箱
-    # --ask-for-approval on-request: Codex 自己判断是否需要问用户
-    cmd = "cd /root && codex --no-alt-screen --sandbox danger-full-access --ask-for-approval on-request"
-    proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"
-    )
-    await proc.communicate()
-    logger.info(f"[Start] Codex launched in tmux session '{TMUX_SESSION}'")
-
-    # 等待 Codex 初始化，然后绑定最新 session JSONL
-    await asyncio.sleep(8)
+    # 无论如何，启动时都要绑定最新 session JSONL
     refresh_session_jsonl()
 
 
@@ -293,7 +310,7 @@ async def stop_codex_in_tmux():
     """发送 Ctrl+C 停止 Codex。"""
     for key in ["C-c", "Enter", "C-c"]:
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, key, ""
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", key, ""
         )
         await proc.communicate()
         await asyncio.sleep(0.3)
@@ -323,7 +340,7 @@ async def restart_codex_in_tmux():
     # 启动 Codex
     cmd = "cd /root && codex --no-alt-screen --sandbox danger-full-access --ask-for-approval on-request"
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", cmd, "Enter"
     )
     await proc.communicate()
 
@@ -370,6 +387,37 @@ async def get_gateway_url() -> str:
     if not url:
         raise RuntimeError(f"Failed to get gateway URL: {data}")
     return url
+
+
+async def send_input_notify(user_openid: str, msg_id: str) -> bool:
+    """发送“正在输入”通知"""
+    token = await ensure_token()
+    client = get_http_client()
+    headers = {
+        "Authorization": f"QQBot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "Codex-QQ-Bridge/1.0",
+    }
+    msg_seq = _next_msg_seq()
+    body = {
+        "msg_type": 6,
+        "input_notify": {"input_type": 1, "input_second": 10},
+        "msg_seq": msg_seq,
+        "msg_id": msg_id,
+    }
+
+    try:
+        resp = await client.post(
+            f"{API_BASE}/v2/users/{user_openid}/messages",
+            headers=headers, json=body, timeout=30.0,
+        )
+        if resp.status_code >= 400:
+            logger.error(f"Typing notify failed [{resp.status_code}]: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Typing notify exception: {e}")
+        return False
 
 
 async def send_message_rest(user_openid: str, content: str) -> bool:
@@ -463,7 +511,7 @@ def _save_master_openid(openid: str):
 
 async def handle_c2c_message(d: dict):
     """处理 QQ C2C 消息。"""
-    global _last_msg_id, _bot_openid
+    global _last_msg_id, _bot_openid, _is_generating
 
     msg_id = str(d.get("id", ""))
     if not msg_id or is_duplicate(msg_id):
@@ -479,6 +527,8 @@ async def handle_c2c_message(d: dict):
         return
 
     _last_msg_id = msg_id
+    _is_generating = True
+    _generating_since = time.time()
     logger.info(f"[Recv] openid={user_openid}: content={content[:50]}, attachments={len(attachments)}")
 
     # Auto-bind MASTER_OPENID
@@ -489,12 +539,14 @@ async def handle_c2c_message(d: dict):
     cmd = content.strip().lower()
 
     if cmd in ["/new", "/reset", "/qingkong", "/xin duihua"]:
+        _is_generating = False
         logger.info("[Recv] New session command")
         await restart_codex_in_tmux()
         await send_message_rest(user_openid, "✅ Codex 已重启，新会话已开始。")
         return
 
     if cmd in ["/stop", "/tingzhi", "/kill"]:
+        _is_generating = False
         logger.info("[Recv] Stop command")
         await stop_codex_in_tmux()
         await send_message_rest(user_openid, "⛔ Codex 已停止。")
@@ -538,12 +590,25 @@ def build_attachment_text(attachments: list) -> str:
 
 async def jsonl_poll():
     """后台轮询 Codex session JSONL，增量推送回复到 QQ。"""
-    global _jsonl_watermark, _last_sent_ts
+    global _jsonl_watermark, _last_sent_ts, _is_generating, _last_typing_sent_time
 
     # 启动时绑定最新的 session JSONL
     refresh_session_jsonl()
 
     while _running:
+        now = time.time()
+
+        # _is_generating 超时自动 reset（300s，防 Codex 崩溃永久卡死）
+        if _is_generating and _generating_since > 0 and (now - _generating_since > 300):
+            logger.warning(f"[Poll] _is_generating timeout ({int(now - _generating_since)}s), auto-reset")
+            _is_generating = False
+            _generating_since = 0.0
+
+        # 触发/续杯“正在输入中”的顶部状态
+        if _is_generating and _last_msg_id and (now - _last_typing_sent_time > 2.5):
+            asyncio.create_task(send_input_notify(MASTER_OPENID, _last_msg_id))
+            _last_typing_sent_time = now
+
         await asyncio.sleep(2)
 
         try:
@@ -554,8 +619,11 @@ async def jsonl_poll():
                 await asyncio.sleep(1)
                 continue
 
-            # 2. 检测文件大小变化
-            curr_lines = count_lines(_jsonl_path)
+            # 2. 读取文件所有行（仅读取一次，防止多次读取的竞争问题）
+            with open(_jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+
+            curr_lines = len(lines)
 
             # 处理日志截断（文件变小 = 被重写了）
             if curr_lines < _jsonl_watermark:
@@ -565,40 +633,35 @@ async def jsonl_poll():
             if curr_lines <= _jsonl_watermark:
                 continue
 
-            # 3. 增量读取新行
-            new_texts: List[str] = []
-            with open(_jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-
-            for line in lines[_jsonl_watermark:]:
+            pushed = 0
+            for line in lines[_jsonl_watermark:curr_lines]:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     obj = json.loads(line)
-                    actions = find_actions(obj)
-                    for act in actions:
-                        act = act.strip()
-                        if act:
-                            logger.info(f"[Poll -> QQ Action] {act}")
-                            await send_message_rest(MASTER_OPENID, act)
-                            await asyncio.sleep(0.3)
-                except Exception:
-                    pass
 
-                text = parse_codex_line(line)
-                if text:
-                    # 防历史刷屏：如果是旧行（已有 watermark），跳过
-                    new_texts.append(text)
+                    # 时间戳去重（防文件截断/rotate 后历史消息重推）
+                    ts = obj.get("timestamp", "")
+                    if ts and _last_sent_ts and ts <= _last_sent_ts:
+                        continue
+
+                    text = translate_structured_line(obj)
+                    if text and isinstance(text, str) and text.strip():
+                        logger.info(f"[Poll -> QQ] ts={ts} {text[:80]}")
+                        _is_generating = False
+                        _generating_since = 0.0
+                        if ts:
+                            _last_sent_ts = ts
+                        await send_message_rest(MASTER_OPENID, text.strip())
+                        await asyncio.sleep(0.3)
+                        pushed += 1
+                except Exception as e:
+                    logger.warning(f"[Poll] line skipped: {e}")
 
             _jsonl_watermark = curr_lines
-
-            # 4. 推送到 QQ
-            for text in new_texts:
-                if text:
-                    logger.info(f"[Poll -> QQ] {text[:100]}")
-                    await send_message_rest(MASTER_OPENID, text)
-                    await asyncio.sleep(0.3)  # 避免 QQ API 限频
+            if pushed:
+                logger.info(f"[Poll] pushed {pushed} structured msgs")
 
         except Exception as e:
             logger.error(f"[Poll] Error: {e}")
