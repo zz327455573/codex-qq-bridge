@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: codex-qq-bridge
+Version: 1.0.0
+Summary: Codex QQ Bridge - Connect OpenAI Codex CLI to QQ instant messaging
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: aiohttp
+Requires-Dist: httpx
+Dynamic: license-file
+
 # Codex QQ Bridge 🚀
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)

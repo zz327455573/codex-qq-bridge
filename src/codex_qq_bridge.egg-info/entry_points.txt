@@ -1,0 +1,2 @@
+[console_scripts]
+codex-qq-bridge = codex_qq_bridge.bridge:cli

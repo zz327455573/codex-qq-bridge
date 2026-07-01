@@ -1,0 +1,12 @@
+LICENSE
+README.md
+pyproject.toml
+src/codex_qq_bridge/__init__.py
+src/codex_qq_bridge/__main__.py
+src/codex_qq_bridge/bridge.py
+src/codex_qq_bridge.egg-info/PKG-INFO
+src/codex_qq_bridge.egg-info/SOURCES.txt
+src/codex_qq_bridge.egg-info/dependency_links.txt
+src/codex_qq_bridge.egg-info/entry_points.txt
+src/codex_qq_bridge.egg-info/requires.txt
+src/codex_qq_bridge.egg-info/top_level.txt
