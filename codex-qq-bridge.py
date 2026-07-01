@@ -127,11 +127,11 @@ def get_http_client():
 # ================= Codex 会话检测 =================
 
 def find_latest_session_jsonl() -> Optional[Path]:
-    """按 mtime 找最新的 Codex session JSONL 文件。"""
+    """按文件名时间戳找最新的 Codex session JSONL 文件（不用 mtime，防重启瞬间误判）。"""
     if not CODEX_SESSION_DIR.exists():
         return None
     files = sorted(CODEX_SESSION_DIR.rglob("rollout-*.jsonl"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
+                   key=lambda p: p.name, reverse=True)
     return files[0] if files else None
 
 
